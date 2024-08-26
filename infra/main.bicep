@@ -23,13 +23,6 @@ param sqlServerName string = ''
 param sqlDatabaseName string = 'northwind'
 param keyVaultName string = ''
 
-@secure()
-@description('SQL Server administrator password')
-param sqlAdminPassword string
-@secure()
-@description('Application user password')
-param appUserPassword string
-
 var abbrs = loadJsonContent('./abbreviations.json')
 var resourceToken = toLower(uniqueString(subscription().id, environmentName, location))
 var tags = { 'azd-env-name': environmentName, 'app': 'ai-agents', 'tracing': 'yes' }
@@ -121,20 +114,6 @@ module monitoring './core/monitor/monitoring.bicep' = {
   }
 }
 
-module sqlServer './core/data/sql.bicep' = {
-  name: 'sql'
-  scope: resourceGroup
-  params: {
-    name: !empty(sqlServerName) ? sqlServerName : '${abbrs.sqlServers}${resourceToken}'
-    databaseName: sqlDatabaseName
-    location: location
-    tags: tags
-    sqlAdminPassword: sqlAdminPassword
-    appUserPassword: appUserPassword
-    keyVaultName: keyVault.outputs.name
-  }
-}
-
 // Store secrets in a keyvault
 module keyVault './core/security/keyvault.bicep' = {
   name: 'keyvault'
@@ -168,7 +147,3 @@ output AZURE_OPENAI_EMBEDDING_DEPLOYMENT_NAME string = embeddingDeploymentModelN
 output AZURE_AI_SEARCH_NAME string = search.outputs.searchName
 output AZURE_AI_SEARCH_ENDPOINT string = search.outputs.searchEndpoint
 output AZURE_AI_SEARCH_KEY string = search.outputs.searchAdminKey
-output AZURE_SQL_SERVER_NAME string = sqlServer.outputs.serverName
-output AZURE_SQL_APP_USER string = sqlServer.outputs.appUser
-output AZURE_SQL_DATABASE_NAME string = sqlServer.outputs.databaseName
-output AZURE_SQL_CONNECTIONSTRING string = sqlServer.outputs.connectionString
