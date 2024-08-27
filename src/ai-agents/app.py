@@ -1,41 +1,17 @@
 import os
-import json
+import asyncio
 import dotenv
 from azure.identity import DefaultAzureCredential, get_bearer_token_provider
 from llama_agents.message_queues.apache_kafka import KafkaMessageQueue
 
-from llama_agents import (
-    AgentService,
-    HumanService,
-    ControlPlaneServer,
-    SimpleMessageQueue,
-    PipelineOrchestrator,
-    ServiceComponent,
-    LocalLauncher,
-)
-from llama_agents import (
-    AgentService,
-    AgentOrchestrator,
-    ControlPlaneServer,
-    SimpleMessageQueue,
-)
+dotenv.load_dotenv()
+
+from llama_index.llms.azure_openai import AzureOpenAI
 
 from llama_index.core.agent import ReActAgent
 from llama_index.core.tools import FunctionTool
-from llama_index.llms.openai import OpenAI
+from llama_agents import AgentService
 
-from llama_index.core.agent import FunctionCallingAgentWorker
-from llama_index.core.tools import FunctionTool
-from llama_index.core.query_pipeline import RouterComponent, QueryPipeline
-from llama_index.llms.openai import OpenAI
-from llama_index.core.selectors import PydanticSingleSelector
-
-dotenv.load_dotenv()
-
-
-from llama_index.llms.azure_openai import AzureOpenAI
-from llama_index.embeddings.azure_openai import AzureOpenAIEmbedding
-from llama_index.core import VectorStoreIndex, SimpleDirectoryReader
 import logging
 import sys
 
@@ -46,10 +22,13 @@ logging.getLogger().addHandler(logging.StreamHandler(stream=sys.stdout))
 
 from llama_index.core import Settings
 
-KAFKA_CONNECTION_URL = os.getenv("KAFKA_URL")
+kafka_connection_url = os.getenv("KAFKA_URL")
+control_plane_host = os.getenv("CONTROL_PLANE_HOST")
+control_plane_port = os.getenv("CONTROL_PLANE_PORT")
+tools_agent_host = os.getenv("AGENT_HOST")
+tools_agent_port = os.getenv("AGENT_PORT")
 
 llm: AzureOpenAI = None
-embeddings_model: AzureOpenAIEmbedding = None
 if "AZURE_OPENAI_API_KEY" in os.environ:
     llm = AzureOpenAI(
         model=os.getenv("AZURE_OPENAI_COMPLETION_MODEL"),
@@ -59,13 +38,6 @@ if "AZURE_OPENAI_API_KEY" in os.environ:
         api_version=os.getenv("AZURE_OPENAI_VERSION")
     )
 
-    embeddings_model = AzureOpenAIEmbedding(
-        model=os.getenv("AZURE_OPENAI_EMBEDDING_MODEL"),
-        azure_deployment=os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT_NAME"),
-        api_key=os.getenv("AZURE_OPENAI_API_KEY"),
-        azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
-        api_version=os.getenv("AZURE_OPENAI_VERSION"),
-    )
 else:
     token_provider = get_bearer_token_provider(DefaultAzureCredential(), "https://cognitiveservices.azure.com/.default")
     llm = AzureOpenAI(
@@ -77,23 +49,8 @@ else:
         azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
         api_version=os.getenv("AZURE_OPENAI_VERSION")
     )
-    embeddings_model = AzureOpenAIEmbedding(
-        model=os.getenv("AZURE_OPENAI_EMBEDDING_MODEL"),
-        azure_deployment=os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT_NAME"),
-        api_key=os.getenv("AZURE_OPENAI_API_KEY"),
-        azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
-        api_version=os.getenv("AZURE_OPENAI_VERSION"),
-    )
 
 Settings.llm = llm
-Settings.embed_model = embeddings_model
-
-# # create our multi-agent framework components
-# message_queue = SimpleMessageQueue()
-from llama_index.llms.ollama import Ollama
-
-phi = Ollama(base_url='http://localhost:11434', model='phi3.5', temperature=0.8, request_timeout=300,
-             system_prompt="You are an agent that returns a random response to any question. You change the topic and answer the negative of the corr")
 
 import time
 
@@ -128,54 +85,35 @@ machine_tools_1 = FunctionTool.from_defaults(fn=get_machine_status)
 machine_tools_2 = FunctionTool.from_defaults(fn=get_number_of_machine_jobs)
 order_tools_1 = FunctionTool.from_defaults(fn=get_order_status)
 
-agent1 = ReActAgent.from_tools([machine_tools_1, machine_tools_2], llm=llm)
-agent2 = ReActAgent.from_tools([], llm=llm)
+agent1 = ReActAgent.from_tools([machine_tools_1, machine_tools_2, order_tools_1], llm=llm)
 
-from llama_index.core.tools import FunctionTool
+message_queue = KafkaMessageQueue(url=kafka_connection_url)
 
-message_queue = KafkaMessageQueue(url=KAFKA_CONNECTION_URL)
-
-# create our multi-agent framework components
-control_plane = ControlPlaneServer(
-    message_queue=message_queue,
-    orchestrator=AgentOrchestrator(llm=llm),
-    port=8001,
-)
-agent_server_1 = AgentService(
+agent_server = AgentService(
     agent=agent1,
     message_queue=message_queue,
-    description="Useful for getting the information and status of the production machine.",
-    service_name="machine_information_agent",
-    port=8002,
-)
-agent_server_2 = AgentService(
-    agent=agent2,
-    message_queue=message_queue,
-    description="Useful for getting information about order status.",
-    service_name="order_status_agent",
-    port=8003,
+    description="Useful for getting information about machines and orders.",
+    service_name="order_machine_agent",
+    host=tools_agent_host,
+    port=int(tools_agent_port) if tools_agent_port else None,
 )
 
-from llama_agents import LocalLauncher
-import nest_asyncio
+app = agent_server._app
 
-# needed for running in a notebook
-nest_asyncio.apply()
+# registration
+async def register_and_start_consuming() -> None:
+    # register to message queue
+    start_consuming_callable = await agent_server.register_to_message_queue()
+    # register to control plane
+    await agent_server.register_to_control_plane(
+        control_plane_url=(
+            f"http://{control_plane_host}:{control_plane_port}"
+            if control_plane_port
+            else f"http://{control_plane_host}"
+        )
+    )
+    # start consuming
+    await start_consuming_callable()
 
-# launch it
-launcher = LocalLauncher(
-    [agent_server_1, agent_server_2],
-    control_plane,
-    message_queue,
-)
-
-while True:
-    try:
-        line = input()
-        print(f"{bcolors.OKBLUE}#### Question: {line}{bcolors.ENDC}")
-        result = launcher.launch_single(line)
-        print(f"{bcolors.WARNING}#### Response: {result}{bcolors.ENDC}")
-    except EOFError:
-        break
-    if line == "q":
-        break
+if __name__ == "__main__":
+    asyncio.run(register_and_start_consuming())
